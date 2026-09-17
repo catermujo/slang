@@ -496,7 +496,18 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
             auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type);
             m_writer->emit("array");
             m_writer->emit("<");
-            emitType(structuredBufferType->getElementType());
+            auto elementType = structuredBufferType->getElementType();
+            if (type->getOp() == kIROp_HLSLRWStructuredBufferType &&
+                elementType->getOp() == kIROp_UIntType)
+            {
+                m_writer->emit("atomic<");
+                emitType(elementType);
+                m_writer->emit(">");
+            }
+            else
+            {
+                emitType(elementType);
+            }
             m_writer->emit(">");
         }
         break;
@@ -1249,6 +1260,19 @@ bool WGSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
     {
     default:
         return false;
+    case kIROp_RWStructuredBufferStore:
+        {
+            if (inst->getOperand(2)->getDataType()->getOp() != kIROp_UIntType)
+                return false;
+            m_writer->emit("atomicStore(&(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            m_writer->emit("[");
+            emitOperand(inst->getOperand(1), getInfo(EmitOp::General));
+            m_writer->emit("]), ");
+            emitOperand(inst->getOperand(2), getInfo(EmitOp::General));
+            m_writer->emit(");\n");
+            return true;
+        }
     case kIROp_AtomicLoad:
         {
             emitInstResultDecl(inst);
@@ -1410,6 +1434,21 @@ bool WGSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
     }
 }
 
+void WGSLSourceEmitter::_emitStoreImpl(IRStore* store)
+{
+    auto ptr = store->getPtr();
+    if (ptr->getOp() == kIROp_RWStructuredBufferGetElementPtr)
+    {
+        m_writer->emit("atomicStore(&(");
+        emitOperand(ptr, getInfo(EmitOp::General));
+        m_writer->emit("), ");
+        emitOperand(store->getVal(), getInfo(EmitOp::General));
+        m_writer->emit(");\n");
+        return;
+    }
+    CLikeSourceEmitter::_emitStoreImpl(store);
+}
+
 void WGSLSourceEmitter::emitCallArg(IRInst* inst)
 {
     if (as<IRPointerLikeType>(inst->getDataType()) || as<IRPtrTypeBase>(inst->getDataType()))
@@ -1460,6 +1499,20 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
 
     switch (inst->getOp())
     {
+    case kIROp_Load:
+        {
+            auto ptr = inst->getOperand(0);
+            if (ptr->getOp() == kIROp_RWStructuredBufferGetElementPtr &&
+                inst->getDataType()->getOp() == kIROp_UIntType)
+            {
+                m_writer->emit("atomicLoad(&(");
+                emitOperand(ptr, getInfo(EmitOp::General));
+                m_writer->emit("))");
+                return true;
+            }
+        }
+        break;
+
     case kIROp_MakeVectorFromScalar:
         {
             // In WGSL this is done by calling the vec* overloads listed in [1]
@@ -1593,10 +1646,20 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
     case kIROp_RWStructuredBufferLoad:
     case kIROp_RWStructuredBufferGetElementPtr:
         {
+            if (inst->getOp() == kIROp_RWStructuredBufferLoad &&
+                inst->getDataType()->getOp() == kIROp_UIntType)
+            {
+                m_writer->emit("atomicLoad(&(");
+            }
             emitOperand(inst->getOperand(0), leftSide(outerPrec, getInfo(EmitOp::Postfix)));
             m_writer->emit("[");
             emitOperand(inst->getOperand(1), getInfo(EmitOp::General));
             m_writer->emit("]");
+            if (inst->getOp() == kIROp_RWStructuredBufferLoad &&
+                inst->getDataType()->getOp() == kIROp_UIntType)
+            {
+                m_writer->emit("))");
+            }
             return true;
         }
         break;
@@ -1836,6 +1899,9 @@ void WGSLSourceEmitter::emitInterpolationModifiersImpl(
     IRType* /* valueType */,
     IRVarLayout* /* layout */)
 {
+    if (!varInst->findDecoration<IRSemanticDecoration>())
+        return;
+
     char const* interpolationType = nullptr;
     char const* interpolationSampling = nullptr;
     for (auto dd : varInst->getDecorations())
