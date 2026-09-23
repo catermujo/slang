@@ -1738,7 +1738,13 @@ void HLSLSourceEmitter::emitFuncDecorationImpl(IRDecoration* decoration)
     switch (decoration->getOp())
     {
     case kIROp_NoInlineDecoration:
-        m_writer->emit("[noinline]\n");
+        // DUMBAI: DXC rejects retained shader helpers with vector or struct parameters during DXIL
+        // validation.
+        if (getTargetReq()->getTarget() != CodeGenTarget::DXIL &&
+            getTargetReq()->getTarget() != CodeGenTarget::DXILAssembly)
+        {
+            m_writer->emit("[noinline]\n");
+        }
         break;
 
     case kIROp_MaxRecordsDecoration:
