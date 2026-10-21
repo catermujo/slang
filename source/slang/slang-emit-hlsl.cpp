@@ -1697,6 +1697,25 @@ static bool _canEmitExport(const Profile& profile)
     Super::emitFuncDecorationsImpl(func);
 }
 
+// DUMBAI: FXC may fail while flattening retained helper calls that read global memory,
+// including constant buffers; the failure also depends on the emitted #line locations.
+// Preserve the IR's control flow around these calls. For example,
+// `enabled && loadUav()` lowers to a call in one successor block; FXC otherwise reports
+// "internal error: flattened side effect". Intrinsics without a body retain normal selection.
+static bool hasRetainedHelperCall(IRBlock* block)
+{
+    for (auto inst : block->getOrdinaryInsts())
+    {
+        if (auto call = as<IRCall>(inst))
+        {
+            auto callee = as<IRFunc>(getResolvedInstForDecorations(call->getCallee()));
+            if (callee && callee->getFirstBlock())
+                return true;
+        }
+    }
+    return false;
+}
+
 void HLSLSourceEmitter::emitIfDecorationsImpl(IRIfElse* ifInst)
 {
     if (ifInst->findDecorationImpl(kIROp_BranchDecoration))
@@ -1706,6 +1725,14 @@ void HLSLSourceEmitter::emitIfDecorationsImpl(IRIfElse* ifInst)
     else if (ifInst->findDecorationImpl(kIROp_FlattenDecoration))
     {
         m_writer->emit("[flatten]\n");
+    }
+    else if (
+        m_effectiveProfile.getFamily() == ProfileFamily::DX &&
+        m_effectiveProfile.getVersion() < ProfileVersion::DX_6_0 &&
+        (hasRetainedHelperCall(ifInst->getTrueBlock()) ||
+         hasRetainedHelperCall(ifInst->getFalseBlock())))
+    {
+        m_writer->emit("[branch]\n");
     }
 }
 
