@@ -2,6 +2,14 @@
 
 #include "core/slang-io.h"
 #include "core/slang-test-tool-util.h"
+#include "core/slang-writer.h"
+
+#include <cstdio>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include "slang.h"
 #include "slang/slang-internal.h"
 
@@ -111,10 +119,94 @@ SLANG_TEST_TOOL_API SlangResult innerMain(
     return res;
 }
 
+// DUMBAI: Frame UTF-8 arguments and captured output independently of shell quoting and Windows text
+// mode.
+static bool readBatchUInt(UInt32& value)
+{
+    unsigned char bytes[4];
+    if (fread(bytes, 1, sizeof(bytes), stdin) != sizeof(bytes))
+        return false;
+    value = UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16) |
+            (UInt32(bytes[3]) << 24);
+    return true;
+}
+
+static bool writeBatchUInt(UInt32 value)
+{
+    unsigned char bytes[] = {
+        (unsigned char)value,
+        (unsigned char)(value >> 8),
+        (unsigned char)(value >> 16),
+        (unsigned char)(value >> 24)};
+    return fwrite(bytes, 1, sizeof(bytes), stdout) == sizeof(bytes);
+}
+
+static bool writeBatchText(const StringBuilder& text)
+{
+    return writeBatchUInt(UInt32(text.getLength())) &&
+           fwrite(text.getBuffer(), 1, text.getLength(), stdout) == size_t(text.getLength());
+}
+
+static SlangResult serveBatch(StdWriters* defaultWriters)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    SlangGlobalSessionDesc desc = {};
+    desc.enableGLSL = true;
+    ComPtr<slang::IGlobalSession> session;
+    SLANG_RETURN_ON_FAIL(slang::createGlobalSession(&desc, session.writeRef()));
+    if (fwrite("SLB1", 1, 4, stdout) != 4 || fflush(stdout) != 0)
+        return SLANG_FAIL;
+
+    // DUMBAI: Each request retains the CLI's isolated compile request while sharing only built-in
+    // modules.
+    for (;;)
+    {
+        UInt32 argumentCount;
+        if (!readBatchUInt(argumentCount))
+            return feof(stdin) ? SLANG_OK : SLANG_FAIL;
+        List<String> arguments;
+        for (UInt32 index = 0; index < argumentCount; ++index)
+        {
+            UInt32 length;
+            if (!readBatchUInt(length))
+                return SLANG_FAIL;
+            List<char> bytes;
+            bytes.setCount(Index(length) + 1);
+            if (fread(bytes.getBuffer(), 1, length, stdin) != length)
+                return SLANG_FAIL;
+            bytes[length] = 0;
+            arguments.add(String(bytes.getBuffer()));
+        }
+        List<const char*> pointers;
+        for (const auto& argument : arguments)
+            pointers.add(argument.getBuffer());
+
+        StringBuilder output;
+        StringBuilder errors;
+        StringWriter outWriter(&output, WriterFlag::IsStatic);
+        StringWriter errorWriter(&errors, WriterFlag::IsStatic);
+        StdWriters writers;
+        writers.setWriter(SLANG_WRITER_CHANNEL_STD_OUTPUT, &outWriter);
+        writers.setWriter(SLANG_WRITER_CHANNEL_STD_ERROR, &errorWriter);
+        writers.setWriter(SLANG_WRITER_CHANNEL_DIAGNOSTIC, &errorWriter);
+        SlangResult result =
+            innerMain(&writers, session, int(pointers.getCount()), pointers.getBuffer());
+        StdWriters::setSingleton(defaultWriters);
+        if (!writeBatchUInt(UInt32(TestToolUtil::getReturnCode(result))) ||
+            !writeBatchText(output) || !writeBatchText(errors) || fflush(stdout) != 0)
+            return SLANG_FAIL;
+    }
+}
+
 int MAIN(int argc, char** argv)
 {
     auto stdWriters = StdWriters::initDefaultSingleton();
-    SlangResult res = innerMain(stdWriters, nullptr, argc, argv);
+    SlangResult res = argc == 2 && UnownedStringSlice(argv[1]) == "-batch"
+                          ? serveBatch(stdWriters)
+                          : innerMain(stdWriters, nullptr, argc, argv);
     slang::shutdown();
     return (int)TestToolUtil::getReturnCode(res);
 }
